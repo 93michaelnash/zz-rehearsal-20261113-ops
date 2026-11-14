@@ -426,6 +426,7 @@ jobs:
           # The CLI writes one JSON line to stdout and exits non-zero on refusal. The verdict is in the JSON, not the exit code.
           env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
             node template/tools/modules/cli.mjs "${args[@]}" 2>"$RUNNER_TEMP/engine.err" | head -c 1048576 >"$RUNNER_TEMP/engine-out/engine.json" || true
+            head -c 3000 "$RUNNER_TEMP/engine.err" | tr -cd '[:print:][:space:]' | sed 's/^/ENGINE-STDERR: /' || true
 
       - name: Upload engine.json (untrusted)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
