@@ -1,0 +1,920 @@
+# REFERENCE workflow for the Foundana build-modules ops repo (FDNA-089 / P5). Never run hosted by its author:
+# it was written and validated offline only (YAML parse; actionlint not installed). See README.md in this folder.
+#
+# Install at .github/workflows/module-ops.yml in MODULE_OPS_REPO, default branch `main` (Central dispatches ref=main).
+# Contract: foundana-central docs/build-modules/module-ops-runner-contract.md (clauses J3-1..J3-11), api/lib/modules/runner.ts
+# (validateDispatch), runnerArtefact.ts (result.json). Spec: R-22, R-31, R-33, R-44, R-45, T-1, T-14, T-20.
+#
+# Every `uses:` below is `<pin sha>` on purpose: resolve each to a full 40-hex commit SHA of the named release BEFORE
+# installing (do not leave a tag). No SHA was invented here.
+#
+# Jobs:   gate -> ec_fetch -> ec_engine -> ec_emit (enable_check) | engine (install, upgrade) -> publish (job 3)
+#         -> result (job 2: assembles result.json, no client checkout)
+# Rules:  no `${{ inputs.* }}` inside a `run:` script (inputs reach scripts only through env); no secret outside the
+#         step that mints a token; the engine job holds NO secret except a read-only token minted from the read App;
+#         ec_engine holds no token and no secret at all; engine-derived data reaches job outputs only through the
+#         template's ops-emit.mjs (enable_check) or a grammar check (engine job), never a bare `echo >> $GITHUB_OUTPUT`.
+# FDNA-088b (W1-W6): ninth input `project_ref`; gate validates it and the provisional switches; enable_check is split
+#         into ec_fetch / ec_engine / ec_emit; result.json echoes environment, project_ref, provisional and acceptance.
+
+name: module-ops
+run-name: "module-ops ${{ inputs.operation_id }} ${{ inputs.verb }} ${{ inputs.target_repo }}" # Central finds the run by operation_id in this name
+
+on:
+  workflow_dispatch:
+    # The closed set Central sends (runner.ts dispatchRun). Nothing else may be added without changing Central.
+    inputs:
+      operation_id:
+        description: "Module operation id (uuid)"
+        required: true
+        type: string
+      target_repo:
+        description: "Client repo, owner/name, must belong to a Central build"
+        required: true
+        type: string
+      engine_commit:
+        description: "Pinned template commit (40 hex); must equal vars.MODULE_ENGINE_COMMIT"
+        required: true
+        type: string
+      module:
+        description: "Module name"
+        required: true
+        type: string
+      version:
+        description: "Module version x.y.z"
+        required: true
+        type: string
+      environment:
+        description: "dev or production"
+        required: true
+        type: choice
+        options: [dev, production]
+      verb:
+        description: "install, upgrade or enable_check"
+        required: true
+        type: choice
+        options: [install, upgrade, enable_check]
+      ref:
+        description: "deployment_sha: the client commit being checked (40 hex)"
+        required: true
+        type: string
+      project_ref:
+        description: "Supabase project ref of the target environment (20 lower-case letters), derived by Central"
+        required: true
+        type: string
+
+# Least privilege at workflow level: the GITHUB_TOKEN gets no scope in any job (artefact up/download uses the runtime
+# token, not GITHUB_TOKEN). All repository access is through short-lived App installation tokens.
+permissions: {}
+
+concurrency:
+  # One module operation per client repo at a time; Central also holds its own operation lock.
+  group: module-ops-${{ inputs.target_repo }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------------------------------------------
+  # gate: validates every input exactly as Central's validateDispatch does, before any token exists.
+  # ---------------------------------------------------------------------------------------------------------------
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions: {}
+    outputs:
+      ok: ${{ steps.check.outputs.ok }}
+      error: ${{ steps.check.outputs.error }}
+      repo_name: ${{ steps.check.outputs.repo_name }}
+      template_name: ${{ steps.check.outputs.template_name }}
+      # Validated echoes (set only when ok=true): the result job reflects these back to Central (D7).
+      environment: ${{ steps.check.outputs.environment }}
+      project_ref: ${{ steps.check.outputs.project_ref }}
+      # true only for the exact string "true" in MODULE_PROVISIONAL_ALLOWED and only for dev (D9).
+      provisional_allowed: ${{ steps.check.outputs.provisional_allowed }}
+      template_ref: ${{ steps.check.outputs.template_ref }}
+    steps:
+      - id: check
+        env:
+          OP_ID: ${{ inputs.operation_id }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          ENGINE_COMMIT: ${{ inputs.engine_commit }}
+          MODULE: ${{ inputs.module }}
+          VERSION: ${{ inputs.version }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          VERB: ${{ inputs.verb }}
+          REF_SHA: ${{ inputs.ref }}
+          PROJECT_REF: ${{ inputs.project_ref }}
+          PINNED_ENGINE_COMMIT: ${{ vars.MODULE_ENGINE_COMMIT }}
+          CLIENT_OWNER: ${{ vars.MODULE_CLIENT_OWNER }}
+          TEMPLATE_REPO: ${{ vars.MODULE_TEMPLATE_REPO }}
+          TEMPLATE_REF: ${{ vars.MODULE_TEMPLATE_REF }}
+          PROVISIONAL_ALLOWED: ${{ vars.MODULE_PROVISIONAL_ALLOWED }}
+          RUN_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          # Fail closed but exit 0: the result job turns the code into result.json (error_stage "inputs").
+          fail() { { echo "ok=false"; echo "error=$1"; } >>"$GITHUB_OUTPUT"; echo "::error::dispatch input refused: $1"; exit 0; }
+          [[ "$RUN_REF" == "refs/heads/main" ]] || fail wrong_workflow_ref
+          [[ "$OP_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || fail operation_id_invalid
+          [[ "$TARGET_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail target_repo_invalid
+          [[ "$MODULE" =~ ^[a-z][a-z0-9-]*$ ]] || fail module_invalid
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail version_invalid
+          [[ "$REF_SHA" =~ ^[0-9a-f]{40}$ ]] || fail ref_invalid
+          [[ "$PROJECT_REF" =~ ^[a-z]{20}$ ]] || fail project_ref_invalid
+          [[ "$ENGINE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail engine_commit_invalid
+          [[ "$PINNED_ENGINE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail engine_pin_not_configured
+          # Central sends its pin; the ops repo holds its own copy and the two must agree (R-22: pin and verify).
+          [[ "$ENGINE_COMMIT" == "$PINNED_ENGINE_COMMIT" ]] || fail engine_commit_not_pinned
+          case "$VERB" in install|upgrade|enable_check) ;; *) fail verb_invalid ;; esac
+          case "$ENVIRONMENT" in dev|production) ;; *) fail environment_invalid ;; esac
+          # Production is refused for every writing verb (Central's worker refuses production for all verbs).
+          if [[ "$ENVIRONMENT" == "production" && "$VERB" != "enable_check" ]]; then fail production_refused; fi
+          owner="${TARGET_REPO%%/*}"; name="${TARGET_REPO#*/}"
+          [[ "$name" != "." && "$name" != ".." && "$name" != *.git ]] || fail target_repo_invalid
+          [[ -n "$CLIENT_OWNER" && "$owner" == "$CLIENT_OWNER" ]] || fail target_owner_not_allowed
+          [[ "$TEMPLATE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && "${TEMPLATE_REPO%%/*}" == "$CLIENT_OWNER" ]] || fail template_repo_not_configured
+          # D9: provisional mode (an unmerged template pin) is allowed only for the exact string "true", never for production.
+          prov=false; tref=""
+          if [[ "$PROVISIONAL_ALLOWED" == "true" ]]; then
+            if [[ "$ENVIRONMENT" == "production" ]]; then fail provisional_refused_production; fi
+            [[ "$TEMPLATE_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ && "$TEMPLATE_REF" != *..* && "$TEMPLATE_REF" != */ ]] || fail template_ref_invalid
+            prov=true; tref="$TEMPLATE_REF"
+          fi
+          # Every value below passed a closed grammar above, so none can carry a newline.
+          { echo "ok=true"; echo "error="; echo "repo_name=$name"; echo "template_name=${TEMPLATE_REPO#*/}"
+            echo "environment=$ENVIRONMENT"; echo "project_ref=$PROJECT_REF"; echo "provisional_allowed=$prov"; echo "template_ref=$tref"; } >>"$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # enable_check (T-20 job 1, FDNA-088b W3-W5), three jobs so that no job holds both a token and client code:
+  #   ec_fetch  read token; runs NO client code; reads the client only as git objects; computes pack_hash and
+  #             readable_tables with the template's trusted code; hands the template and a client bundle on as artefacts.
+  #   ec_engine NO token, NO secret, `permissions: {}`, no `environment:`; runs the engine's enable-check on the client
+  #             bundle; its only product is engine.json (untrusted). It declares NO job outputs on purpose.
+  #   ec_emit   NO token, runs NO client code; maps the untrusted engine.json with the template's ops-emit.mjs, the only
+  #             writer of the engine-derived outputs.
+  # ---------------------------------------------------------------------------------------------------------------
+  ec_fetch:
+    needs: gate
+    if: needs.gate.outputs.ok == 'true' && inputs.verb == 'enable_check'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: module-ops-read # holds MODULE_READ_APP_PRIVATE_KEY only; the runner App key is not in this environment
+    permissions: {}
+    outputs:
+      fetch_ok: ${{ steps.compute.outputs.fetch_ok }}
+      source_sha: ${{ steps.compute.outputs.source_sha }}
+      pack_hash: ${{ steps.compute.outputs.pack_hash }}
+      readable_tables: ${{ steps.compute.outputs.readable_tables }}
+      error_stage: ${{ steps.compute.outputs.error_stage || steps.fetch.outputs.error_stage || steps.merged.outputs.error_stage }}
+      error_code: ${{ steps.compute.outputs.error_code || steps.fetch.outputs.error_code || steps.merged.outputs.error_code }}
+    steps:
+      - id: read_token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.MODULE_READ_APP_ID }}
+          private-key: ${{ secrets.MODULE_READ_APP_PRIVATE_KEY }}
+          owner: ${{ vars.MODULE_CLIENT_OWNER }}
+          repositories: ${{ needs.gate.outputs.repo_name }},${{ needs.gate.outputs.template_name }}
+          permission-contents: read
+
+      - name: Check out the template at the pinned engine commit (trusted code)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ vars.MODULE_TEMPLATE_REPO }}
+          ref: ${{ inputs.engine_commit }}
+          path: template
+          token: ${{ steps.read_token.outputs.token }}
+          persist-credentials: false
+          fetch-depth: 0 # all branches, so merged-ness against main (or MODULE_TEMPLATE_REF) can be computed
+
+      - id: merged
+        name: Verify the template checkout is the pinned commit and is on main (or on MODULE_TEMPLATE_REF when provisional)
+        env:
+          ENGINE_COMMIT: ${{ inputs.engine_commit }}
+          PROVISIONAL_ALLOWED: ${{ needs.gate.outputs.provisional_allowed }}
+          TEMPLATE_REF: ${{ needs.gate.outputs.template_ref }}
+        run: |
+          set -euo pipefail
+          fail() { { echo "error_stage=enable_check"; echo "error_code=$1"; } >>"$GITHUB_OUTPUT"; echo "::error::$1"; exit 0; }
+          test "$(git -C template rev-parse HEAD)" = "$ENGINE_COMMIT"
+          if [[ "$PROVISIONAL_ALLOWED" == "true" ]]; then
+            # D9: the pinned commit is not required to be on main, but it must be on the declared integration branch.
+            ref="refs/remotes/origin/$TEMPLATE_REF"; code=template_commit_not_on_ref
+          else
+            ref="refs/remotes/origin/main"; code=provisional_not_allowed
+          fi
+          git -C template rev-parse --verify -q "$ref^{commit}" >/dev/null || fail "$code"
+          git -C template merge-base --is-ancestor "$ENGINE_COMMIT" "$ref" || fail "$code"
+          echo "merged=true" >>"$GITHUB_OUTPUT"
+
+      - id: fetch
+        name: Fetch the client ref into a bare repo (read only; nothing from it is executed or checked out)
+        if: steps.merged.outputs.merged == 'true'
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+          REF_SHA: ${{ inputs.ref }}
+          READ_TOKEN: ${{ steps.read_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          fail() { { echo "error_stage=enable_check"; echo "error_code=$1"; } >>"$GITHUB_OUTPUT"; echo "::error::$1"; exit 0; }
+          AUTH="$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 -w0)"
+          echo "::add-mask::$AUTH"
+          echo "::add-mask::$READ_TOKEN"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+          # The token reaches git only as an http header for github.com, never in a URL or argv, and only in this step.
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $AUTH"
+          export GIT_CONFIG_KEY_1="core.hooksPath" GIT_CONFIG_VALUE_1="$RUNNER_TEMP/no-hooks"
+          unset READ_TOKEN AUTH
+          mkdir -p "$RUNNER_TEMP/no-hooks" "$RUNNER_TEMP/client.git"
+          git init --bare -q "$RUNNER_TEMP/client.git"
+          # Full depth on purpose: `git bundle create` refuses a shallow repository, and the engine job clones the bundle.
+          git -C "$RUNNER_TEMP/client.git" fetch -q "https://github.com/$TARGET_REPO.git" "$REF_SHA" || fail ref_fetch_failed
+          got="$(git -C "$RUNNER_TEMP/client.git" rev-parse FETCH_HEAD)"
+          [[ "$got" == "$REF_SHA" ]] || fail ref_mismatch
+          git -C "$RUNNER_TEMP/client.git" update-ref refs/heads/ops-ref "$REF_SHA"
+          echo "fetched=true" >>"$GITHUB_OUTPUT"
+
+      # No token in this step's env. Trusted code only: the workflow-authored script below plus the template's
+      # ops-contract.mjs (computePackHash) and seams.mjs, both at the pinned commit. Client files are read as git blobs.
+      - id: compute
+        name: Compute pack_hash and readable_tables from committed blobs (data only, trusted script)
+        if: steps.fetch.outputs.fetched == 'true'
+        env:
+          MODULE: ${{ inputs.module }}
+          REF_SHA: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          cat >"$RUNNER_TEMP/ec-compute.mjs" <<'EOF'
+          // Reads the client as git objects (argv-only git, scrubbed env). Nothing from the client is executed.
+          import { execFileSync } from 'node:child_process';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          const [, , bare, templateRoot, moduleName, ref, outFile] = process.argv;
+          const out = { fetch_ok: '', source_sha: ref, pack_hash: '', readable_tables: '', error_stage: '', error_code: '' };
+          const gitEnv = { PATH: process.env.PATH, HOME: process.env.RUNNER_TEMP, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+          const git = (args) => execFileSync('git', ['-C', bare, ...args], { env: gitEnv, maxBuffer: 256 * 1024 * 1024 });
+          const HEX40 = /^[0-9a-f]{40}$/, HEX64 = /^[0-9a-f]{64}$/;
+          // Strict, single-line writer. The values are either fixed words, hex digests, closed-grammar codes or JSON this
+          // script re-serialised itself; anything else aborts with no output (the job then fails and the result says so).
+          const emit = () => {
+            if (!HEX40.test(out.source_sha)) throw new Error('source_sha');
+            if (out.pack_hash !== '' && !HEX64.test(out.pack_hash)) throw new Error('pack_hash');
+            if (out.error_stage !== '' && !/^[a-z0-9_]{1,40}$/.test(out.error_stage)) throw new Error('error_stage');
+            if (out.error_code !== '' && !/^[a-z0-9_]{1,60}$/.test(out.error_code)) throw new Error('error_code');
+            if (out.readable_tables !== '' && (out.readable_tables.length > 300000 || /[\n\r\0]/.test(out.readable_tables))) throw new Error('readable_tables');
+            fs.writeFileSync(outFile, Object.entries(out).map(([k, v]) => `${k}=${v}\n`).join(''));
+          };
+          const stop = (code) => { out.fetch_ok = 'false'; out.error_stage = 'enable_check'; out.error_code = String(code).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 60); out.pack_hash = ''; out.readable_tables = ''; emit(); process.exit(0); };
+          try {
+            // One tree listing: `<mode> <type> <sha>\t<path>\0`. Used to refuse anything that is not a regular file.
+            const modes = new Map();
+            for (const rec of git(['ls-tree', '-r', '-z', ref]).toString('utf8').split('\0')) {
+              const tab = rec.indexOf('\t');
+              if (tab > 0) modes.set(rec.slice(tab + 1), rec.slice(0, tab).split(' ')[0]);
+            }
+            const regular = (p) => modes.get(p) === '100644' || modes.get(p) === '100755';
+            const blob = (p) => { if (!regular(p)) throw Object.assign(new Error('not a regular file'), { stopCode: 'pack_file_missing' }); return new Uint8Array(git(['cat-file', 'blob', `${ref}:${p}`])); };
+            if (!regular('modules.lock.json')) stop('lock_unreadable');
+            let lock;
+            try { lock = JSON.parse(Buffer.from(blob('modules.lock.json')).toString('utf8')); } catch { stop('lock_unreadable'); }
+            const entry = lock?.modules?.[moduleName];
+            if (!entry || typeof entry.files !== 'object' || entry.files === null) stop('module_not_installed');
+            const contract = await import(pathToFileURL(path.join(templateRoot, 'tools/modules/ops-contract.mjs')).href);
+            try { out.pack_hash = contract.computePackHash(Object.keys(entry.files), blob); }
+            catch (e) { stop(e?.code ?? e?.stopCode ?? 'pack_hash_failed'); }
+            // readable_tables: only literal `grant select (cols) on [public.]table to governed_reader` statements.
+            // Pack migrations that grant through format()/dynamic SQL cannot be read statically: reported, not guessed.
+            const sql = {};
+            for (const p of [...modes.keys()].filter((n) => /^supabase\/migrations\/[^/]+\.sql$/.test(n)).sort()) sql[p.slice(p.lastIndexOf('/') + 1)] = Buffer.from(blob(p)).toString('utf8');
+            let inventory;
+            try {
+              const { schemaInventory } = await import(pathToFileURL(path.join(templateRoot, 'tools/modules/seams.mjs')).href);
+              inventory = new Map(schemaInventory(sql).map((t) => [t.name, new Map(t.columns.map((c) => [c.name, c.freeText]))]));
+            } catch { stop('schema_inventory_unavailable'); }
+            const GRANT = /grant\s+select\s*\(([^)]*)\)\s+on\s+(?:table\s+)?(?:public\.)?"?([a-z_][a-z0-9_]*)"?\s+to\s+governed_reader\b/gi;
+            const tables = new Map();
+            let mentions = false;
+            for (const text of Object.values(sql)) {
+              if (/governed_reader/i.test(text)) mentions = true;
+              for (const m of text.matchAll(GRANT)) {
+                const cols = tables.get(m[2]) ?? new Map();
+                for (const c of m[1].split(',').map((s) => s.trim().replace(/^"|"$/g, '')).filter(Boolean)) {
+                  if (!/^[a-z_][a-z0-9_]{0,127}$/.test(c)) stop('column_name_unsupported');
+                  // Unknown column type means free text (fail closed), the same rule as the engine's inventory.
+                  cols.set(c, inventory.get(m[2])?.get(c) ?? true);
+                }
+                tables.set(m[2], cols);
+              }
+            }
+            if (tables.size === 0 && mentions) stop('readable_tables_unparsed');
+            const list = [...tables.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([table, cols]) => ({
+              table, columns: [...cols.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([name, free_text]) => ({ name, free_text })),
+            }));
+            if (list.length > 500 || list.some((t) => t.columns.length > 500)) stop('readable_tables_too_large');
+            // An empty list is a real answer ("no readable tables"); `[]` is sent, not null.
+            out.readable_tables = JSON.stringify(list);
+            out.fetch_ok = 'true';
+            emit();
+          } catch (e) {
+            if (e?.stopCode) stop(e.stopCode);
+            stop('compute_failed');
+          }
+          EOF
+          node "$RUNNER_TEMP/ec-compute.mjs" "$RUNNER_TEMP/client.git" "$GITHUB_WORKSPACE/template" "$MODULE" "$REF_SHA" "$RUNNER_TEMP/ec-out.txt"
+          cat "$RUNNER_TEMP/ec-out.txt" >>"$GITHUB_OUTPUT"
+
+      - name: Bundle the client ref and archive the template for the next jobs (no token in this step)
+        if: steps.compute.outputs.fetch_ok == 'true'
+        run: |
+          set -euo pipefail
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+          mkdir -p "$RUNNER_TEMP/ec-client" "$RUNNER_TEMP/ec-template"
+          git -C "$RUNNER_TEMP/client.git" bundle create "$RUNNER_TEMP/ec-client/client.bundle" refs/heads/ops-ref
+          tar -C "$GITHUB_WORKSPACE" -cf "$RUNNER_TEMP/ec-template/template.tar" template
+
+      - name: Upload the template (trusted copy for ec_engine and ec_emit)
+        if: steps.compute.outputs.fetch_ok == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ec-template
+          path: ${{ runner.temp }}/ec-template
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload the client bundle (data for ec_engine)
+        if: steps.compute.outputs.fetch_ok == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ec-client
+          path: ${{ runner.temp }}/ec-client
+          if-no-files-found: error
+          retention-days: 1
+
+  # ec_engine: the ONLY job that runs the engine on client data. No token is minted here, there is no `environment:` (so no
+  # secret can be read) and `permissions: {}`. It declares no job outputs: whatever the client's files make it write, only
+  # engine.json leaves, as an artefact that ec_emit treats as untrusted input.
+  ec_engine:
+    needs: [gate, ec_fetch]
+    if: needs.ec_fetch.outputs.fetch_ok == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions: {}
+    steps:
+      - name: Download the template and the client bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: ec-*
+          path: ${{ runner.temp }}/ec-in
+
+      - name: Restore the template and clone the client from the bundle (hooks off, no credentials)
+        env:
+          ENGINE_COMMIT: ${{ inputs.engine_commit }}
+          REF_SHA: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$RUNNER_TEMP/no-hooks"
+          mkdir -p "$RUNNER_TEMP/no-hooks" "$RUNNER_TEMP/h"
+          tar -x --no-same-owner -C "$GITHUB_WORKSPACE" -f "$RUNNER_TEMP/ec-in/ec-template/template.tar"
+          test "$(git -C template rev-parse HEAD)" = "$ENGINE_COMMIT"
+          git clone -q -n "$RUNNER_TEMP/ec-in/ec-client/client.bundle" client
+          git -C client -c advice.detachedHead=false checkout -q --detach "$REF_SHA"
+          test "$(git -C client rev-parse HEAD)" = "$REF_SHA"
+
+      # U2: sandbox setup. Open item. Default here: the job holds no token, no secret and no `environment:`, every child runs
+      # under `env -i`, and installs use --ignore-scripts. Restricting network egress to the npm registry is NOT enforceable
+      # from a GitHub-hosted runner in this file (see README, "Not implemented or unverified"); until U2 decides how
+      # (self-hosted runner with an egress policy, or the engine's Docker sandbox as in the engine job), assume client
+      # dependency code can reach the internet during install.
+      - name: npm ci --ignore-scripts in the template (the engine's own dependencies) and in the client
+        run: |
+          set -euo pipefail
+          (cd template && env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" npm ci --ignore-scripts --no-audit --no-fund)
+          # A client install failure is not fatal here: the engine reports what it cannot check, and ec_emit maps it.
+          (cd client && env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" npm ci --ignore-scripts --no-audit --no-fund) || echo "::warning::client npm ci failed"
+
+      - id: engine
+        name: Run the engine's enable-check (trusted template code on client data); stdout is engine.json
+        env:
+          MODULE: ${{ inputs.module }}
+          ENVIRONMENT: ${{ needs.gate.outputs.environment }}
+          PROJECT_REF: ${{ needs.gate.outputs.project_ref }}
+          ENGINE_COMMIT: ${{ inputs.engine_commit }}
+          PROVISIONAL_ALLOWED: ${{ needs.gate.outputs.provisional_allowed }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/engine-out"
+          # The acceptance record location is a template constant (D3), never an input.
+          cat >"$RUNNER_TEMP/accept-path.mjs" <<'EOF'
+          import path from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          const [, , templateRoot, moduleName, env] = process.argv;
+          const { acceptanceRecordPath } = await import(pathToFileURL(path.join(templateRoot, 'tools/modules/ops-contract.mjs')).href);
+          process.stdout.write(acceptanceRecordPath(moduleName, env));
+          EOF
+          ACCEPT_PATH="$(env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" node "$RUNNER_TEMP/accept-path.mjs" "$GITHUB_WORKSPACE/template" "$MODULE" "$ENVIRONMENT")" || ACCEPT_PATH=""
+          # argv only: every value is passed as one array element, never interpolated into a shell string.
+          args=(enable-check --module "$MODULE" --target client --acceptance "$ACCEPT_PATH" --env "$ENVIRONMENT"
+                --project-ref "$PROJECT_REF" --template-root template --template-commit "$ENGINE_COMMIT")
+          # J3-11 (changed by FDNA-088b D9): only under the ops variable AND dev (the gate already refuses production).
+          if [[ "$PROVISIONAL_ALLOWED" == "true" ]]; then args+=(--allow-unmerged-template); fi
+          # The CLI writes one JSON line to stdout and exits non-zero on refusal. The verdict is in the JSON, not the exit code.
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+            node template/tools/modules/cli.mjs "${args[@]}" 2>"$RUNNER_TEMP/engine.err" | head -c 1048576 >"$RUNNER_TEMP/engine-out/engine.json" || true
+
+      - name: Upload engine.json (untrusted)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ec-engine
+          path: ${{ runner.temp }}/engine-out
+          if-no-files-found: error
+          retention-days: 1
+
+  # ec_emit: runs NO client code and holds no token. It reads engine.json as untrusted text; the template's ops-emit.mjs
+  # (pinned commit, node:crypto and node:fs only) maps it and is the only writer of these job outputs.
+  ec_emit:
+    needs: [gate, ec_fetch, ec_engine]
+    if: needs.ec_engine.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions: {}
+    outputs:
+      seam_checks_ok: ${{ steps.emit.outputs.seam_checks_ok }}
+      error_stage: ${{ steps.emit.outputs.error_stage }}
+      error_code: ${{ steps.emit.outputs.error_code }}
+      acceptance_decision_ref: ${{ steps.emit.outputs.acceptance_decision_ref }}
+      acceptance_expires_at: ${{ steps.emit.outputs.acceptance_expires_at }}
+      provisional: ${{ steps.emit.outputs.provisional }}
+    steps:
+      - name: Download the template copy and engine.json
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: ec-{template,engine}
+          path: ${{ runner.temp }}/ec-in
+
+      - id: emit
+        name: Map engine.json and write the result lines (ops-emit.mjs refuses anything outside the grammar)
+        env:
+          ENGINE_COMMIT: ${{ inputs.engine_commit }}
+        run: |
+          set -euo pipefail
+          tar -x --no-same-owner -C "$GITHUB_WORKSPACE" -f "$RUNNER_TEMP/ec-in/ec-template/template.tar"
+          test "$(git -C template rev-parse HEAD)" = "$ENGINE_COMMIT"
+          # ops-emit.mjs appends to the file it is given, in one write, and writes nothing on any refusal (exit non-zero,
+          # which fails this job; the result job then reports error_stage enable_check, error_code job_failed).
+          node template/tools/modules/ops-emit.mjs "$RUNNER_TEMP/ec-in/ec-engine/engine.json" "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # engine (T-20 job 1 for install/upgrade): clean runner, template at the pinned commit, client at ref. Holds only a
+  # read token (minted in a step, never in env of a step that runs client code). Records every step outcome.
+  # ---------------------------------------------------------------------------------------------------------------
+  engine:
+    needs: gate
+    if: needs.gate.outputs.ok == 'true' && inputs.verb != 'enable_check'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: module-ops-read
+    permissions: {}
+    outputs:
+      # GitHub's own step outcomes: job 3 and the result job decide from these, never from a file client code could touch.
+      npm_ci: ${{ steps.npm_ci.outcome }}
+      engine_run: ${{ steps.engine.outcome }}
+      tsc: ${{ steps.tsc.outcome }}
+      vitest: ${{ steps.vitest.outcome }}
+      # Produced by trusted steps that run BEFORE any client code step.
+      source_sha: ${{ steps.verify.outputs.source_sha }}
+      engine_ok: ${{ steps.engine.outputs.engine_ok }}
+      engine_stage: ${{ steps.engine.outputs.engine_stage }}
+      engine_error: ${{ steps.engine.outputs.engine_error }}
+      provisional: ${{ steps.engine.outputs.provisional }}
+      changes_count: ${{ steps.seal.outputs.changes_count }}
+      changeset_ready: ${{ steps.seal.outputs.changeset_ready }}
+    steps:
+      - id: read_token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.MODULE_READ_APP_ID }}
+          private-key: ${{ secrets.MODULE_READ_APP_PRIVATE_KEY }}
+          owner: ${{ vars.MODULE_CLIENT_OWNER }}
+          repositories: ${{ needs.gate.outputs.repo_name }},${{ needs.gate.outputs.template_name }}
+          permission-contents: read
+
+      - name: Check out the template at the pinned engine commit (trusted code)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ vars.MODULE_TEMPLATE_REPO }}
+          ref: ${{ inputs.engine_commit }}
+          path: template
+          token: ${{ steps.read_token.outputs.token }}
+          persist-credentials: false
+          fetch-depth: 0 # the engine checks the template commit is on main
+
+      - name: Check out the client repo at ref (data; the token is not persisted)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ inputs.ref }}
+          path: client
+          token: ${{ steps.read_token.outputs.token }}
+          persist-credentials: false
+          fetch-depth: 0 # the engine needs the dev and main tips
+
+      - id: verify
+        name: Verify both checkouts and install the engine's own dependencies (no scripts)
+        env:
+          ENGINE_COMMIT: ${{ inputs.engine_commit }}
+          REF_SHA: ${{ inputs.ref }}
+          PROVISIONAL_ALLOWED: ${{ needs.gate.outputs.provisional_allowed }}
+          TEMPLATE_REF: ${{ needs.gate.outputs.template_ref }}
+        run: |
+          set -euo pipefail
+          test "$(git -C template rev-parse HEAD)" = "$ENGINE_COMMIT"
+          test "$(git -C client rev-parse HEAD)" = "$REF_SHA"
+          # D9: the pin must be on main, or (provisional dev window only) on the declared integration branch. A failure
+          # here fails the job; the result job reports job_failed. The engine CLI repeats the main check itself.
+          if [[ "$PROVISIONAL_ALLOWED" == "true" ]]; then tref="refs/remotes/origin/$TEMPLATE_REF"; else tref="refs/remotes/origin/main"; fi
+          git -C template rev-parse --verify -q "$tref^{commit}" >/dev/null || { echo "::error::template ref missing"; exit 1; }
+          git -C template merge-base --is-ancestor "$ENGINE_COMMIT" "$tref" || { echo "::error::provisional_not_allowed or template_commit_not_on_ref"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/h"
+          echo "source_sha=$REF_SHA" >>"$GITHUB_OUTPUT"
+          (cd template && env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" npm ci --ignore-scripts --no-audit --no-fund)
+          cat >"$RUNNER_TEMP/run-sandbox.mjs" <<'EOF'
+          // Runs one sandbox kind from the pinned template (docker, read-only mounts, no env, no network for tsc/vitest).
+          import { pathToFileURL } from 'node:url';
+          import path from 'node:path';
+          const [, , templateRoot, kind, target] = process.argv;
+          const mod = await import(pathToFileURL(path.join(templateRoot, 'tools/modules/sandbox.mjs')).href);
+          const r = mod.runInSandbox({ kind, targetDir: path.resolve(target) });
+          process.stdout.write(`${r.stdout}\n`);
+          process.stderr.write(`${r.stderr}\n`);
+          process.exit(r.status);
+          EOF
+
+      # Client-code step 1 of 3. `npm ci --ignore-scripts` runs in the engine's Docker sandbox, so no lifecycle script runs.
+      # Outcome is recorded, not fatal; the later steps and job 3 read it through `steps.npm_ci.outcome`.
+      - id: npm_ci
+        name: npm ci --ignore-scripts (sandbox)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" node "$RUNNER_TEMP/run-sandbox.mjs" "$GITHUB_WORKSPACE/template" npm-ci "$GITHUB_WORKSPACE/client"
+
+      - id: engine
+        name: Run the module engine (trusted template code on client data), then record its verdict
+        if: steps.npm_ci.outcome == 'success'
+        continue-on-error: true
+        env:
+          VERB: ${{ inputs.verb }}
+          MODULE: ${{ inputs.module }}
+          ENGINE_COMMIT: ${{ inputs.engine_commit }}
+          REF_SHA: ${{ inputs.ref }}
+          BOT_NAME: ${{ vars.MODULE_RUNNER_BOT_NAME }}
+          BOT_EMAIL: ${{ vars.MODULE_RUNNER_BOT_EMAIL }}
+          PROVISIONAL_ALLOWED: ${{ needs.gate.outputs.provisional_allowed }}
+        run: |
+          set -uo pipefail
+          # Local commit identity for the engine's work-branch commit only. The published commit is created by job 3
+          # through the API as the App bot; this local commit is read as a diff source and never pushed.
+          MAIN_SHA="$(git -C client rev-parse refs/remotes/origin/main)"
+          # argv only. J3-11 (changed by FDNA-088b D9): the flag only when the ops variable is "true" AND the environment is
+          # dev; the gate already refuses production while provisional is allowed, and install/upgrade are dev-only.
+          args=("$VERB" --module "$MODULE" --target client --template-root template --template-commit "$ENGINE_COMMIT"
+                --dev-sha "$REF_SHA" --main-sha "$MAIN_SHA" --env dev)
+          if [[ "$PROVISIONAL_ALLOWED" == "true" ]]; then args+=(--allow-unmerged-template); fi
+          set +e
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" GIT_AUTHOR_NAME="$BOT_NAME" GIT_AUTHOR_EMAIL="$BOT_EMAIL" \
+            GIT_COMMITTER_NAME="$BOT_NAME" GIT_COMMITTER_EMAIL="$BOT_EMAIL" \
+            node template/tools/modules/cli.mjs "${args[@]}" >"$RUNNER_TEMP/engine.json"
+          code=$?
+          set -e
+          # exit 0 ok, 2 blocked (a verdict), 64/70 usage/internal (a failure). One JSON object on stdout every time.
+          jq -e . "$RUNNER_TEMP/engine.json" >/dev/null
+          ok="$(jq -r '.ok' "$RUNNER_TEMP/engine.json")"
+          stage="$(jq -r '.stage' "$RUNNER_TEMP/engine.json")"
+          err="$(jq -r '.error.code // ""' "$RUNNER_TEMP/engine.json")"
+          # Engine-derived values reach GITHUB_OUTPUT only after a closed grammar check (no newline can pass); `provisional`
+          # is reduced to a literal true/false by jq. An unparseable value fails the step, so nothing is written.
+          prov="$(jq -r 'if .provisional == true then "true" else "false" end' "$RUNNER_TEMP/engine.json")"
+          [[ "$ok" =~ ^(true|false)$ && "$stage" =~ ^[A-Za-z0-9_]{0,40}$ && "$err" =~ ^[A-Za-z0-9_]{0,60}$ && "$prov" =~ ^(true|false)$ ]] || { echo "::error::engine output outside grammar"; exit 1; }
+          { echo "engine_ok=$ok"; echo "engine_stage=$stage"; echo "engine_error=$err"; echo "provisional=$prov"; } >>"$GITHUB_OUTPUT"
+          [[ "$code" == "0" || "$code" == "2" ]]
+
+      - id: seal
+        name: Seal the changeset from the engine commit (git objects only), before any more client code runs
+        if: steps.engine.outcome == 'success' && steps.engine.outputs.engine_ok == 'true'
+        env:
+          OP_ID: ${{ inputs.operation_id }}
+          MODULE: ${{ inputs.module }}
+          VERSION: ${{ inputs.version }}
+          REF_SHA: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+          tgit() { git -C client "$@"; }
+          commit="$(jq -r '.commit // ""' "$RUNNER_TEMP/engine.json")"
+          if [[ -z "$commit" ]]; then echo "changes_count=0" >>"$GITHUB_OUTPUT"; echo "changeset_ready=false" >>"$GITHUB_OUTPUT"; exit 0; fi
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          test "$(tgit rev-parse "$commit^")" = "$REF_SHA"
+          out="$RUNNER_TEMP/changeset"; mkdir -p "$out/blobs"
+          jq -c '[.changes[] | select(.action != "unchanged") | .path]' "$RUNNER_TEMP/engine.json" >"$out/planned.json"
+          jq -r '.pr.description // ""' "$RUNNER_TEMP/engine.json" | head -c 16384 >"$out/pr-body.md"
+          tgit log -1 --format=%B "$commit" | head -c 8192 >"$out/commit-message.txt"
+          : >"$out/files.jsonl"; n=0
+          # raw diff of the engine commit against ref: `:oldmode newmode oldsha newsha status\0path\0`
+          while IFS= read -r -d '' meta && IFS= read -r -d '' p; do
+            read -r _om nm _os ns st <<<"${meta#:}"
+            n=$((n+1)); blob="blobs/$(printf '%04d' "$n")"
+            tgit cat-file blob "$ns" >"$out/$blob"
+            jq -nc --arg path "$p" --arg mode "$nm" --arg status "$st" --arg blob "$blob" \
+              --arg sha "$(sha256sum "$out/$blob" | cut -d' ' -f1)" --argjson size "$(stat -c %s "$out/$blob")" \
+              '{path:$path,mode:$mode,status:$status,blob:$blob,sha256:$sha,size:$size}' >>"$out/files.jsonl"
+          done < <(tgit diff-tree -r --raw -z --no-renames --no-abbrev "$REF_SHA" "$commit")
+          jq -n --arg op "$OP_ID" --arg module "$MODULE" --arg version "$VERSION" --arg base "$REF_SHA" --arg commit "$commit" \
+            --slurpfile files "$out/files.jsonl" --slurpfile planned "$out/planned.json" \
+            '{format:1,operation_id:$op,module:$module,version:$version,base_sha:$base,commit_sha:$commit,planned:$planned[0],files:$files}' >"$out/manifest.json"
+          rm -f "$out/files.jsonl" "$out/planned.json"
+          echo "changes_count=$n" >>"$GITHUB_OUTPUT"
+          echo "changeset_ready=$([[ $n -gt 0 ]] && echo true || echo false)" >>"$GITHUB_OUTPUT"
+
+      # Uploaded BEFORE tsc/vitest so nothing the tests do can alter what job 3 receives.
+      - name: Upload the changeset (diff artefact for job 3)
+        if: steps.seal.outputs.changeset_ready == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: module-changeset
+          path: ${{ runner.temp }}/changeset
+          if-no-files-found: error
+          retention-days: 1
+
+      # Client-code steps 2 and 3. Both run in the engine's Docker sandbox: read-only mount, no env, no network.
+      - id: tsc
+        name: tsc --noEmit (sandbox)
+        if: steps.engine.outcome == 'success' && steps.engine.outputs.engine_ok == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" node "$RUNNER_TEMP/run-sandbox.mjs" "$GITHUB_WORKSPACE/template" tsc "$GITHUB_WORKSPACE/client"
+
+      - id: vitest
+        name: vitest run (sandbox)
+        if: steps.engine.outcome == 'success' && steps.engine.outputs.engine_ok == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" node "$RUNNER_TEMP/run-sandbox.mjs" "$GITHUB_WORKSPACE/template" vitest "$GITHUB_WORKSPACE/client"
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # publish (job 3): NO checkout of client code. Receives only the changeset artefact, verifies it against the planned
+  # file list, then creates a NEW branch and a pull request as the runner App bot through the API.
+  # ---------------------------------------------------------------------------------------------------------------
+  publish:
+    needs: [gate, engine]                                  # J3-1
+    # J3-2: GitHub's own step and job outcomes decide. result.json is not consulted and does not exist yet.
+    if: >-
+      needs.gate.outputs.ok == 'true' &&
+      needs.engine.result == 'success' &&
+      needs.engine.outputs.npm_ci == 'success' &&
+      needs.engine.outputs.tsc == 'success' &&
+      needs.engine.outputs.vitest == 'success' &&
+      needs.engine.outputs.engine_ok == 'true' &&
+      needs.engine.outputs.changeset_ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    environment: module-ops-publish # holds MODULE_RUNNER_APP_PRIVATE_KEY; only this job can read it
+    permissions: {}
+    outputs:
+      pr_url: ${{ steps.publish.outputs.pr_url }}
+      error_code: ${{ steps.publish.outputs.error_code || steps.verify.outputs.error_code }}
+      branch: ${{ steps.publish.outputs.branch }}
+    steps:
+      - name: Download the changeset (no actions/checkout in this job)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: module-changeset
+          path: ${{ runner.temp }}/changeset
+
+      - id: verify
+        name: Verify the changeset against the planned file list (no token exists yet)
+        env:
+          OP_ID: ${{ inputs.operation_id }}
+          MODULE: ${{ inputs.module }}
+          VERSION: ${{ inputs.version }}
+          REF_SHA: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::changeset refused: $1"; echo "error_code=$1" >>"$GITHUB_OUTPUT"; exit 1; }
+          cs="$RUNNER_TEMP/changeset"; m="$cs/manifest.json"
+          jq -e . "$m" >/dev/null || fail manifest_unreadable
+          [[ "$(jq -r '.format' "$m")" == "1" ]] || fail manifest_format
+          [[ "$(jq -r '.operation_id' "$m")" == "$OP_ID" && "$(jq -r '.module' "$m")" == "$MODULE" && "$(jq -r '.version' "$m")" == "$VERSION" ]] || fail manifest_identity
+          [[ "$(jq -r '.base_sha' "$m")" == "$REF_SHA" ]] || fail base_not_ref
+          count="$(jq '.files | length' "$m")"
+          (( count >= 1 && count <= 200 )) || fail file_count
+          # The branch is derived here from validated inputs; a name carried by the artefact is never used.
+          [[ "$(stat -c %s "$cs/commit-message.txt")" -le 8192 && "$(stat -c %s "$cs/pr-body.md")" -le 16384 ]] || fail text_too_large
+          unsafe() { # same rules as the engine's schema/path-rules.mjs
+            local p="$1" seg
+            [[ -n "$p" && "$p" != /* && "$p" != *\\* && "$p" != *:* ]] || return 0
+            IFS='/' read -ra segs <<<"$p"
+            for seg in "${segs[@]}"; do
+              [[ -n "$seg" && "$seg" != "." && "$seg" != ".." && ! "$seg" =~ [.\ ]$ ]] || return 0
+              case "${seg,,}" in .git|node_modules|.github|.husky) return 0 ;; esac
+            done
+            return 1
+          }
+          total=0
+          while IFS= read -r row; do
+            p="$(jq -r '.path' <<<"$row")"; mode="$(jq -r '.mode' <<<"$row")"; st="$(jq -r '.status' <<<"$row")"
+            blob="$(jq -r '.blob' <<<"$row")"; sha="$(jq -r '.sha256' <<<"$row")"; size="$(jq -r '.size' <<<"$row")"
+            if unsafe "$p"; then fail unsafe_path; fi
+            [[ "$mode" == "100644" || "$mode" == "100755" ]] || fail mode_refused
+            [[ "$st" == "A" || "$st" == "M" ]] || fail status_refused
+            [[ "$blob" =~ ^blobs/[0-9]{4}$ ]] || fail blob_name
+            jq -e --arg p "$p" '.planned | index($p) != null' "$m" >/dev/null || fail path_not_planned
+            [[ "$(sha256sum "$cs/$blob" | cut -d' ' -f1)" == "$sha" && "$(stat -c %s "$cs/$blob")" == "$size" ]] || fail blob_hash
+            (( size <= 5242880 )) || fail file_too_large
+            total=$((total + size))
+          done < <(jq -c '.files[]' "$m")
+          (( total <= 20971520 )) || fail changeset_too_large
+
+      # Minted only after verification. The App token is step-scoped (read by the publish step only), minimal scopes,
+      # limited to the one target repo, and revoked by the action's post step when the job ends.
+      - id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.MODULE_RUNNER_APP_ID }}
+          private-key: ${{ secrets.MODULE_RUNNER_APP_PRIVATE_KEY }}
+          owner: ${{ vars.MODULE_CLIENT_OWNER }}
+          repositories: ${{ needs.gate.outputs.repo_name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - id: publish
+        name: Create the branch (never forced) and the pull request (never merged)
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }} # the only step whose env holds the token
+          TARGET_REPO: ${{ inputs.target_repo }}
+          MODULE: ${{ inputs.module }}
+          VERSION: ${{ inputs.version }}
+          VERB: ${{ inputs.verb }}
+        run: |
+          set -euo pipefail
+          set +x
+          echo "::add-mask::$APP_TOKEN"
+          export -n APP_TOKEN # not inherited by any child process; handed explicitly to gh below
+          # J3-9: hooks are off for any git a child might run. No git push is used at all (refs are created by the API).
+          NOHOOKS="$RUNNER_TEMP/no-hooks"; mkdir -p "$NOHOOKS" "$RUNNER_TEMP/gh-home"
+          # J3-10: every child process gets a scrubbed env; GH_TOKEN exists only in gh's env.
+          scrub() { env -i PATH="$PATH" HOME="$RUNNER_TEMP/gh-home" LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+                      GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$NOHOOKS" "$@"; }
+          gh_t() { env -i PATH="$PATH" HOME="$RUNNER_TEMP/gh-home" GH_TOKEN="$APP_TOKEN" GH_HOST=github.com \
+                      GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh "$@"; }
+          fail() { echo "::error::publish failed: $1"; echo "error_code=$1" >>"$GITHUB_OUTPUT"; exit 1; }
+          cs="$RUNNER_TEMP/changeset"; m="$cs/manifest.json"
+          BRANCH="modules/${MODULE}-${VERSION}"
+          [[ "$BRANCH" =~ ^modules/[a-z][a-z0-9-]*-[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail branch_invalid
+          BASE_BRANCH="dev" # J3-7: base is dev, a constant, never an input
+          BASE_SHA="$(scrub jq -r '.base_sha' "$m")"
+          gh_t api "repos/$TARGET_REPO/branches/$BASE_BRANCH" --jq .name >/dev/null || fail base_branch_missing
+          BASE_TREE="$(gh_t api "repos/$TARGET_REPO/git/commits/$BASE_SHA" --jq .tree.sha)" || fail base_commit_missing
+          : >"$RUNNER_TEMP/tree.jsonl"
+          while IFS= read -r row; do
+            p="$(scrub jq -r '.path' <<<"$row")"; mode="$(scrub jq -r '.mode' <<<"$row")"; blob="$(scrub jq -r '.blob' <<<"$row")"
+            sha="$(scrub base64 -w0 "$cs/$blob" | scrub jq -Rs '{content:.,encoding:"base64"}' \
+                   | gh_t api -X POST "repos/$TARGET_REPO/git/blobs" --input - --jq .sha)" || fail blob_create_failed
+            scrub jq -nc --arg p "$p" --arg m "$mode" --arg s "$sha" '{path:$p,mode:$m,type:"blob",sha:$s}' >>"$RUNNER_TEMP/tree.jsonl"
+          done < <(scrub jq -c '.files[]' "$m")
+          TREE="$(scrub jq -s --arg b "$BASE_TREE" '{base_tree:$b,tree:.}' "$RUNNER_TEMP/tree.jsonl" \
+                  | gh_t api -X POST "repos/$TARGET_REPO/git/trees" --input - --jq .sha)" || fail tree_create_failed
+          # J3-6: no git identity is set anywhere: the API attributes the commit to the App bot that owns the token.
+          COMMIT="$(scrub jq -n --rawfile msg "$cs/commit-message.txt" --arg t "$TREE" --arg p "$BASE_SHA" \
+                    '{message:$msg,tree:$t,parents:[$p]}' | gh_t api -X POST "repos/$TARGET_REPO/git/commits" --input - --jq .sha)" || fail commit_create_failed
+          # J3-4: POST only. A branch that already exists makes this 422 and the run fails; there is no PATCH, no force.
+          gh_t api -X POST "repos/$TARGET_REPO/git/refs" -f "ref=refs/heads/$BRANCH" -f "sha=$COMMIT" >/dev/null || fail branch_exists_or_ref_failed
+          # J3-8: body from a file. J3-5: gh pr create only; there is no merge call anywhere in this workflow.
+          URL="$(gh_t pr create --repo "$TARGET_REPO" --base "$BASE_BRANCH" --head "$BRANCH" \
+                  --title "feat(modules): ${VERB} ${MODULE} ${VERSION}" --body-file "$cs/pr-body.md")" || fail pr_create_failed
+          [[ "$URL" =~ ^https://github\.com/${TARGET_REPO//./\\.}/pull/[0-9]+$ ]] || fail pr_url_unexpected
+          { echo "pr_url=$URL"; echo "branch=$BRANCH"; } >>"$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # result (job 2 of the contract's data flow): assembles result.json in a job with NO client checkout, from job
+  # outputs only (never from a file client code could touch). Runs always, so Central finds an artefact whenever possible.
+  # ---------------------------------------------------------------------------------------------------------------
+  result:
+    needs: [gate, ec_fetch, ec_engine, ec_emit, engine, publish]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions: {}
+    steps:
+      - name: Assemble result.json from job outputs
+        env:
+          OP_ID: ${{ inputs.operation_id }}
+          REF_SHA: ${{ inputs.ref }}
+          VERB: ${{ inputs.verb }}
+          GATE_OK: ${{ needs.gate.outputs.ok }}
+          GATE_ERROR: ${{ needs.gate.outputs.error }}
+          # Validated by the gate (closed grammars); echoed back so Central can check what it dispatched (D7).
+          GATE_ENV: ${{ needs.gate.outputs.environment }}
+          GATE_PROJECT_REF: ${{ needs.gate.outputs.project_ref }}
+          # enable_check: ec_fetch (no client code) supplies source_sha, pack_hash, readable_tables; ec_emit supplies the rest.
+          EF_RESULT: ${{ needs.ec_fetch.result }}
+          EF_OK: ${{ needs.ec_fetch.outputs.fetch_ok }}
+          EF_SOURCE: ${{ needs.ec_fetch.outputs.source_sha }}
+          EF_PACK_HASH: ${{ needs.ec_fetch.outputs.pack_hash }}
+          EF_TABLES: ${{ needs.ec_fetch.outputs.readable_tables }}
+          EF_STAGE: ${{ needs.ec_fetch.outputs.error_stage }}
+          EF_CODE: ${{ needs.ec_fetch.outputs.error_code }}
+          EG_RESULT: ${{ needs.ec_engine.result }}
+          EE_RESULT: ${{ needs.ec_emit.result }}
+          EE_SEAM: ${{ needs.ec_emit.outputs.seam_checks_ok }}
+          EE_STAGE: ${{ needs.ec_emit.outputs.error_stage }}
+          EE_CODE: ${{ needs.ec_emit.outputs.error_code }}
+          EE_REF: ${{ needs.ec_emit.outputs.acceptance_decision_ref }}
+          EE_EXPIRES: ${{ needs.ec_emit.outputs.acceptance_expires_at }}
+          EE_PROV: ${{ needs.ec_emit.outputs.provisional }}
+          EN_PROV: ${{ needs.engine.outputs.provisional }}
+          EN_RESULT: ${{ needs.engine.result }}
+          EN_SOURCE: ${{ needs.engine.outputs.source_sha }}
+          EN_NPM_CI: ${{ needs.engine.outputs.npm_ci }}
+          EN_RUN: ${{ needs.engine.outputs.engine_run }}
+          EN_OK: ${{ needs.engine.outputs.engine_ok }}
+          EN_ERROR: ${{ needs.engine.outputs.engine_error }}
+          EN_TSC: ${{ needs.engine.outputs.tsc }}
+          EN_VITEST: ${{ needs.engine.outputs.vitest }}
+          EN_CHANGES: ${{ needs.engine.outputs.changes_count }}
+          PUB_RESULT: ${{ needs.publish.result }}
+          PUB_URL: ${{ needs.publish.outputs.pr_url }}
+          PUB_ERROR: ${{ needs.publish.outputs.error_code }}
+        run: |
+          set -euo pipefail
+          [[ "$OP_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "::error::no valid operation id, no artefact"; exit 1; }
+          # source_sha is the verified checkout sha when a job got that far; otherwise ref, always with error_stage set.
+          src="$REF_SHA"; stage=""; code=""; pack=""; tables=""; url=""; seam=""; acc_ref=""; acc_exp=""; checks="false"
+          # provisional is never null (Central: z.boolean().optional()). Unknown after a passed gate means true: fail closed,
+          # a provisional or unknown lock never satisfies the production gate (D9).
+          prov="true"
+          lower() { printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_\n' '_' | cut -c1-64; }
+          if [[ "$GATE_OK" != "true" ]]; then stage="inputs"; code="$(lower "${GATE_ERROR:-gate_failed}")"
+          elif [[ "$VERB" == "enable_check" ]]; then
+            [[ -n "$EF_SOURCE" ]] && src="$EF_SOURCE"
+            if [[ "$EF_RESULT" != "success" ]]; then stage="enable_check"; code="job_failed"
+            elif [[ "$EF_OK" != "true" ]]; then stage="${EF_STAGE:-enable_check}"; code="$(lower "${EF_CODE:-enable_check_fetch_failed}")"
+            elif [[ "$EG_RESULT" != "success" || "$EE_RESULT" != "success" ]]; then stage="enable_check"; code="job_failed"; pack="$EF_PACK_HASH"; tables="$EF_TABLES"
+            else
+              pack="$EF_PACK_HASH"; tables="$EF_TABLES"; seam="$EE_SEAM"; stage="$EE_STAGE"; code="$(lower "$EE_CODE")"
+              acc_ref="$EE_REF"; acc_exp="$EE_EXPIRES"
+              [[ "$EE_PROV" == "true" || "$EE_PROV" == "false" ]] && prov="$EE_PROV"
+            fi
+          else
+            [[ -n "$EN_SOURCE" ]] && src="$EN_SOURCE"
+            [[ "$EN_PROV" == "true" || "$EN_PROV" == "false" ]] && prov="$EN_PROV"
+            if [[ "$EN_NPM_CI" == "success" && "$EN_TSC" == "success" && "$EN_VITEST" == "success" ]]; then checks="true"; fi
+            if [[ "$EN_RESULT" != "success" ]]; then stage="engine"; code="job_failed"
+            elif [[ "$EN_NPM_CI" != "success" ]]; then stage="npm_ci"; code="npm_ci_failed"
+            elif [[ "$EN_RUN" != "success" ]]; then stage="engine"; code="engine_run_failed"
+            elif [[ "$EN_OK" != "true" ]]; then stage="engine"; code="$(lower "${EN_ERROR:-engine_blocked}")"
+            elif [[ "$EN_TSC" != "success" ]]; then stage="tsc"; code="tsc_failed"
+            elif [[ "$EN_VITEST" != "success" ]]; then stage="vitest"; code="vitest_failed"
+            elif [[ "${EN_CHANGES:-0}" == "0" ]]; then : # nothing to change: success with no pull request
+            elif [[ "$PUB_RESULT" != "success" ]]; then stage="publish"; code="$(lower "${PUB_ERROR:-publish_failed}")"
+            else url="$PUB_URL"; fi
+          fi
+          [[ "$src" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no valid source sha, no artefact"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/result"
+          # Echo fields (D7) only when the gate validated them; a refused gate sends none. `checks` only for install/upgrade
+          # that got through npm ci, tsc and vitest (Central refuses those artefacts without all three "passed").
+          jq -n --arg op "$OP_ID" --arg src "$src" --arg pack "$pack" --arg tables "$tables" --arg stage "$stage" --arg code "$code" --arg url "$url" \
+            --arg gate "$GATE_OK" --arg env "$GATE_ENV" --arg pref "$GATE_PROJECT_REF" --arg prov "$prov" --arg verb "$VERB" --arg seam "$seam" \
+            --arg accref "$acc_ref" --arg accexp "$acc_exp" --arg checks "$checks" '
+            {operation_id:$op, source_sha:$src,
+             pack_hash:(if $pack == "" then null else $pack end),
+             readable_tables:(if $tables == "" then null else ($tables | fromjson) end),
+             seam_checks_ok:(if $seam == "true" then true elif $seam == "false" then false else null end),
+             error_stage:(if $stage == "" then null else $stage end),
+             error_code:(if $code == "" then null else $code end),
+             install_pr_url:(if $url == "" then null else $url end)}
+            + (if $gate == "true" then {environment:$env, project_ref:$pref, provisional:($prov == "true"),
+                 acceptance:(if $accref == "" or $accexp == "" then null else {decision_ref:$accref, expires_at:$accexp} end)} else {} end)
+            + (if $gate == "true" and $verb != "enable_check" and $checks == "true" then {checks:{npm_ci:"passed", tsc:"passed", vitest:"passed"}} else {} end)' >"$RUNNER_TEMP/result/result.json"
+          # Same limits as Central's reader: at most 512 KB unpacked (256 KB compressed). Keep clear of both.
+          if [[ "$(stat -c %s "$RUNNER_TEMP/result/result.json")" -gt 400000 ]]; then
+            jq -n --arg op "$OP_ID" --arg src "$src" '{operation_id:$op,source_sha:$src,error_stage:"result",error_code:"result_too_large"}' >"$RUNNER_TEMP/result/result.json"
+          fi
+          jq -e . "$RUNNER_TEMP/result/result.json" >/dev/null
+          echo "result.json keys: $(jq -c 'keys' "$RUNNER_TEMP/result/result.json")" # names only: values may include table names
+
+      # Exactly one entry, `result.json`, in an artefact named `module-result` (Central's ARTEFACT_NAME).
+      - name: Upload module-result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: module-result
+          path: ${{ runner.temp }}/result/result.json
+          if-no-files-found: error
+          retention-days: 3
