@@ -427,6 +427,21 @@ jobs:
           env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
             node template/tools/modules/cli.mjs "${args[@]}" 2>"$RUNNER_TEMP/engine.err" | head -c 1048576 >"$RUNNER_TEMP/engine-out/engine.json" || true
             head -c 3000 "$RUNNER_TEMP/engine.err" | tr -cd '[:print:][:space:]' | sed 's/^/ENGINE-STDERR: /' || true
+          # DIAG (rehearsal only): call the engine's own sandbox and show why docker does not answer.
+          cat >"$RUNNER_TEMP/diag.mjs" <<'DIAGEOF'
+          import path from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          const root = process.argv[2];
+          const { runInSandbox } = await import(pathToFileURL(path.join(root, 'template/tools/modules/sandbox.mjs')).href);
+          try {
+            const r = runInSandbox({ kind: 'format', targetDir: path.join(root, 'client'), input: JSON.stringify(['README.md']) });
+            console.log('DIAG status', r.status);
+            console.log('DIAG stderr', String(r.stderr).replace(/[^\x20-\x7e]/g, ' ').slice(0, 1500));
+            console.log('DIAG stdout', String(r.stdout).slice(0, 200));
+          } catch (e) { console.log('DIAG threw', String(e && e.message).slice(0, 500)); }
+          DIAGEOF
+          (docker --version; docker info --format '{{.ServerVersion}} {{.OperatingSystem}}') 2>&1 | sed 's/^/DIAG docker: /' | head -4 || true
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" node "$RUNNER_TEMP/diag.mjs" "$GITHUB_WORKSPACE" 2>&1 | head -20 || true
 
       - name: Upload engine.json (untrusted)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
