@@ -5,8 +5,8 @@
 # Contract: foundana-central docs/build-modules/module-ops-runner-contract.md (clauses J3-1..J3-11), api/lib/modules/runner.ts
 # (validateDispatch), runnerArtefact.ts (result.json). Spec: R-22, R-31, R-33, R-44, R-45, T-1, T-14, T-20.
 #
-# Every `uses:` below is `<pin sha>` on purpose: resolve each to a full 40-hex commit SHA of the named release BEFORE
-# installing (do not leave a tag). No SHA was invented here.
+# Every `uses:` is pinned to a full 40-hex commit SHA, with the release it was resolved from in the trailing comment
+# (checked to exist upstream on 2026-11-16). Re-resolve when bumping a release; never leave a tag.
 #
 # Jobs:   gate -> ec_fetch -> ec_engine -> ec_emit (enable_check) | engine (install, upgrade) -> publish (job 3)
 #         -> result (job 2: assembles result.json, no client checkout)
@@ -16,6 +16,10 @@
 #         template's ops-emit.mjs (enable_check) or a grammar check (engine job), never a bare `echo >> $GITHUB_OUTPUT`.
 # FDNA-088b (W1-W6): ninth input `project_ref`; gate validates it and the provisional switches; enable_check is split
 #         into ec_fetch / ec_engine / ec_emit; result.json echoes environment, project_ref, provisional and acceptance.
+# FDNA-093b (WP2): verb `adopt` (dev only). The adopt map is read from the fixed path modules/adopt/<module>.json as a git
+#         blob at `ref` BEFORE any npm ci or client code; `--on-drift` is never passed; the sealed changeset must be exactly
+#         modules.lock.json; result.json carries `adopt_code` (lower-case snake_case). This file changed, so it needs a fresh
+#         J3 acceptance by a person before Central dispatches writing verbs (README).
 
 name: module-ops
 run-name: "module-ops ${{ inputs.operation_id }} ${{ inputs.verb }} ${{ inputs.target_repo }}" # Central finds the run by operation_id in this name
@@ -50,10 +54,10 @@ on:
         type: choice
         options: [dev, production]
       verb:
-        description: "install, upgrade or enable_check"
+        description: "install, upgrade, adopt (dev only) or enable_check"
         required: true
         type: choice
-        options: [install, upgrade, enable_check]
+        options: [install, upgrade, enable_check, adopt]
       ref:
         description: "deployment_sha: the client commit being checked (40 hex)"
         required: true
@@ -128,7 +132,7 @@ jobs:
           [[ "$PINNED_ENGINE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail engine_pin_not_configured
           # Central sends its pin; the ops repo holds its own copy and the two must agree (R-22: pin and verify).
           [[ "$ENGINE_COMMIT" == "$PINNED_ENGINE_COMMIT" ]] || fail engine_commit_not_pinned
-          case "$VERB" in install|upgrade|enable_check) ;; *) fail verb_invalid ;; esac
+          case "$VERB" in install|upgrade|enable_check|adopt) ;; *) fail verb_invalid ;; esac
           case "$ENVIRONMENT" in dev|production) ;; *) fail environment_invalid ;; esac
           # Production is refused for every writing verb (Central's worker refuses production for all verbs).
           if [[ "$ENVIRONMENT" == "production" && "$VERB" != "enable_check" ]]; then fail production_refused; fi
@@ -426,22 +430,6 @@ jobs:
           # The CLI writes one JSON line to stdout and exits non-zero on refusal. The verdict is in the JSON, not the exit code.
           env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
             node template/tools/modules/cli.mjs "${args[@]}" 2>"$RUNNER_TEMP/engine.err" | head -c 1048576 >"$RUNNER_TEMP/engine-out/engine.json" || true
-            head -c 3000 "$RUNNER_TEMP/engine.err" | tr -cd '[:print:][:space:]' | sed 's/^/ENGINE-STDERR: /' || true
-          # DIAG (rehearsal only): call the engine's own sandbox and show why docker does not answer.
-          cat >"$RUNNER_TEMP/diag.mjs" <<'DIAGEOF'
-          import path from 'node:path';
-          import { pathToFileURL } from 'node:url';
-          const root = process.argv[2];
-          const { runInSandbox } = await import(pathToFileURL(path.join(root, 'template/tools/modules/sandbox.mjs')).href);
-          try {
-            const r = runInSandbox({ kind: 'format', targetDir: path.join(root, 'client'), input: JSON.stringify(['README.md']) });
-            console.log('DIAG status', r.status);
-            console.log('DIAG stderr', String(r.stderr).replace(/[^\x20-\x7e]/g, ' ').slice(0, 1500));
-            console.log('DIAG stdout', String(r.stdout).slice(0, 200));
-          } catch (e) { console.log('DIAG threw', String(e && e.message).slice(0, 500)); }
-          DIAGEOF
-          (docker --version; docker info --format '{{.ServerVersion}} {{.OperatingSystem}}') 2>&1 | sed 's/^/DIAG docker: /' | head -4 || true
-          env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" node "$RUNNER_TEMP/diag.mjs" "$GITHUB_WORKSPACE" 2>&1 | head -20 || true
 
       - name: Upload engine.json (untrusted)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -510,6 +498,11 @@ jobs:
       provisional: ${{ steps.engine.outputs.provisional }}
       changes_count: ${{ steps.seal.outputs.changes_count }}
       changeset_ready: ${{ steps.seal.outputs.changeset_ready }}
+      # adopt only (empty for every other verb). All values are fixed words from the engine's adopt code grammar.
+      adopt_map_ok: ${{ steps.adopt_map.outputs.adopt_map_ok }}
+      adopt_map_code: ${{ steps.adopt_map.outputs.adopt_map_code }}
+      adopt_code: ${{ steps.engine.outputs.adopt_code }}
+      seal_code: ${{ steps.seal.outputs.seal_code }}
     steps:
       - id: read_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
@@ -539,6 +532,36 @@ jobs:
           token: ${{ steps.read_token.outputs.token }}
           persist-credentials: false
           fetch-depth: 0 # the engine needs the dev and main tips
+
+      # adopt only. Runs BEFORE any npm ci and before any client code. The map is a git blob read at `ref` from the fixed
+      # path modules/adopt/<module>.json: ls-tree (does not follow symlinks, so a symlinked directory yields no entry),
+      # entry must be a regular blob (mode 100644), size <= 256 KiB. A copy lands outside the client tree. The engine
+      # validates the contents strictly. Any refusal exits 0 with a fixed code so the result job can report it; nothing
+      # of the client's content (path lists, values) is ever written to a log or an output.
+      - id: adopt_map
+        name: Read the adopt map as a git blob (adopt only; no client code runs)
+        if: inputs.verb == 'adopt'
+        env:
+          MODULE: ${{ inputs.module }}
+          REF_SHA: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+          fail() { { echo "adopt_map_ok=false"; echo "adopt_map_code=adopt_map_invalid"; } >>"$GITHUB_OUTPUT"; echo "::error::adopt map refused: $1"; exit 0; }
+          [[ "$MODULE" =~ ^[a-z][a-z0-9-]*$ && "$REF_SHA" =~ ^[0-9a-f]{40}$ ]] || fail input
+          MAP_PATH="modules/adopt/${MODULE}.json"
+          mapfile -d '' -t recs < <(git -C client ls-tree -z --full-tree "$REF_SHA" -- "$MAP_PATH") || fail ls_tree
+          [[ "${#recs[@]}" -eq 1 ]] || fail not_found
+          rec="${recs[0]}"
+          [[ "${rec#*$'\t'}" == "$MAP_PATH" ]] || fail path
+          read -r mode otype sha <<<"${rec%%$'\t'*}"
+          [[ "$mode" == "100644" && "$otype" == "blob" && "$sha" =~ ^[0-9a-f]{40}$ ]] || fail not_regular_file
+          size="$(git -C client cat-file -s "$sha")" || fail size
+          [[ "$size" =~ ^[0-9]{1,9}$ ]] && (( size >= 2 && size <= 262144 )) || fail size
+          git -C client cat-file blob "$sha" >"$RUNNER_TEMP/adopt-map.json" || fail read
+          [[ "$(stat -c %s "$RUNNER_TEMP/adopt-map.json")" == "$size" ]] || fail size_changed
+          jq -e 'type == "object"' "$RUNNER_TEMP/adopt-map.json" >/dev/null 2>&1 || fail not_json_object
+          { echo "adopt_map_ok=true"; echo "adopt_map_code="; } >>"$GITHUB_OUTPUT"
 
       - id: verify
         name: Verify both checkouts and install the engine's own dependencies (no scripts)
@@ -575,6 +598,8 @@ jobs:
       # Outcome is recorded, not fatal; the later steps and job 3 read it through `steps.npm_ci.outcome`.
       - id: npm_ci
         name: npm ci --ignore-scripts (sandbox)
+        # An adopt whose map was refused runs no client code at all. Other verbs: unchanged (implicit success()).
+        if: inputs.verb != 'adopt' || steps.adopt_map.outputs.adopt_map_ok == 'true'
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -587,6 +612,7 @@ jobs:
         env:
           VERB: ${{ inputs.verb }}
           MODULE: ${{ inputs.module }}
+          VERSION: ${{ inputs.version }}
           ENGINE_COMMIT: ${{ inputs.engine_commit }}
           REF_SHA: ${{ inputs.ref }}
           BOT_NAME: ${{ vars.MODULE_RUNNER_BOT_NAME }}
@@ -602,6 +628,18 @@ jobs:
           args=("$VERB" --module "$MODULE" --target client --template-root template --template-commit "$ENGINE_COMMIT"
                 --dev-sha "$REF_SHA" --main-sha "$MAIN_SHA" --env dev)
           if [[ "$PROVISIONAL_ALLOWED" == "true" ]]; then args+=(--allow-unmerged-template); fi
+          if [[ "$VERB" == "adopt" ]]; then
+            # The map is the git blob copied by the adopt_map step (outside the client tree). Withhold is the engine's default
+            # under adopt; the flag is passed anyway. --expect-version makes the engine refuse a template manifest at another version.
+            args+=(--adopt-map "$RUNNER_TEMP/adopt-map.json" --expect-version "$VERSION" --withhold-new-migrations)
+            # Any failure from here on carries a code; the final value is written (and wins) only after a clean parse.
+            echo "adopt_code=adopt_failed" >>"$GITHUB_OUTPUT"
+          fi
+          # Guard (review finding M2): the workflow never passes the engine's drift override. Unexpected drift must block;
+          # reviewed drift is carried by the map's acknowledged_drift list instead.
+          for a in "${args[@]}"; do
+            case "$a" in --on-drift|--on-drift=*) echo "::error::forbidden engine argument"; exit 1 ;; esac
+          done
           set +e
           env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" GIT_AUTHOR_NAME="$BOT_NAME" GIT_AUTHOR_EMAIL="$BOT_EMAIL" \
             GIT_COMMITTER_NAME="$BOT_NAME" GIT_COMMITTER_EMAIL="$BOT_EMAIL" \
@@ -617,6 +655,37 @@ jobs:
           # is reduced to a literal true/false by jq. An unparseable value fails the step, so nothing is written.
           prov="$(jq -r 'if .provisional == true then "true" else "false" end' "$RUNNER_TEMP/engine.json")"
           [[ "$ok" =~ ^(true|false)$ && "$stage" =~ ^[A-Za-z0-9_]{0,40}$ && "$err" =~ ^[A-Za-z0-9_]{0,60}$ && "$prov" =~ ^(true|false)$ ]] || { echo "::error::engine output outside grammar"; exit 1; }
+          if [[ "$VERB" == "adopt" ]]; then
+            # m3: the engine's own report must name this module and version; otherwise the lock is not what was asked for.
+            # Fail closed: the verdict becomes a block with the adopt_lock_invalid code, so nothing is sealed or published.
+            adopt_code=""
+            if [[ "$ok" == "true" ]]; then
+              ever="$(jq -r '.version // ""' "$RUNNER_TEMP/engine.json")"; emod="$(jq -r '.module // ""' "$RUNNER_TEMP/engine.json")"
+              if [[ "$ever" != "$VERSION" || "$emod" != "$MODULE" ]]; then ok="false"; stage="adopt"; err="adopt_lock_invalid"; adopt_code="adopt_lock_invalid"; fi
+            fi
+            if [[ -z "$adopt_code" ]]; then
+              # The code comes from the template's own adoptCode (pinned commit), reduced to its closed set here.
+              # (heredoc body and terminator sit at the block's base indentation on purpose)
+              cat >"$RUNNER_TEMP/adopt-code.mjs" <<'EOF'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          const [, , templateRoot, file] = process.argv;
+          const { adoptCode } = await import(pathToFileURL(path.join(templateRoot, 'tools/modules/adopt-map.mjs')).href);
+          const r = JSON.parse(fs.readFileSync(file, 'utf8'));
+          const blocked = Array.isArray(r.blocked) ? r.blocked.filter((b) => b && typeof b.code === 'string').map((b) => ({ code: b.code })) : [];
+          const error = r.error && typeof r.error.code === 'string' ? { code: r.error.code } : null;
+          process.stdout.write(String(adoptCode({ ok: r.ok === true, verb: 'adopt', blocked, error })));
+          EOF
+              adopt_code="$(env -i PATH="$PATH" HOME="$RUNNER_TEMP/h" node "$RUNNER_TEMP/adopt-code.mjs" "$GITHUB_WORKSPACE/template" "$RUNNER_TEMP/engine.json")" || adopt_code="adopt_failed"
+            fi
+            case "$adopt_code" in
+              adopt_ok|adopt_map_invalid|adopt_version_mismatch|adopt_withheld_mismatch|adopt_incomplete|adopt_drift_unexpected|adopt_lock_invalid|adopt_failed) ;;
+              *) adopt_code="adopt_failed" ;;
+            esac
+            [[ "$ok" == "true" || "$adopt_code" != "adopt_ok" ]] || adopt_code="adopt_failed"
+            echo "adopt_code=$adopt_code" >>"$GITHUB_OUTPUT"
+          fi
           { echo "engine_ok=$ok"; echo "engine_stage=$stage"; echo "engine_error=$err"; echo "provisional=$prov"; } >>"$GITHUB_OUTPUT"
           [[ "$code" == "0" || "$code" == "2" ]]
 
@@ -628,28 +697,45 @@ jobs:
           MODULE: ${{ inputs.module }}
           VERSION: ${{ inputs.version }}
           REF_SHA: ${{ inputs.ref }}
+          VERB: ${{ inputs.verb }}
         run: |
           set -euo pipefail
           export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
           tgit() { git -C client "$@"; }
+          adopt=false; if [[ "$VERB" == "adopt" ]]; then adopt=true; fi
+          # adopt refusals are verdicts, not crashes: fixed code and reason words only (ids and counts, never paths, diffs or
+          # content hashes of the client), nothing is uploaded, and the result job reports the code (finding m1, M3).
+          sealfail() { { echo "changes_count=0"; echo "changeset_ready=false"; echo "seal_code=$1"; } >>"$GITHUB_OUTPUT"; echo "::error::changeset refused: $2"; exit 0; }
           commit="$(jq -r '.commit // ""' "$RUNNER_TEMP/engine.json")"
-          if [[ -z "$commit" ]]; then echo "changes_count=0" >>"$GITHUB_OUTPUT"; echo "changeset_ready=false" >>"$GITHUB_OUTPUT"; exit 0; fi
+          if [[ -z "$commit" ]]; then
+            # An adopt that reports changes but made no commit is inconsistent: refuse rather than call it a no-op.
+            if $adopt && [[ "$(jq -r '[(.changes // [])[] | select(.action != "unchanged")] | length' "$RUNNER_TEMP/engine.json")" != "0" ]]; then sealfail adopt_failed planned_without_commit; fi
+            echo "changes_count=0" >>"$GITHUB_OUTPUT"; echo "changeset_ready=false" >>"$GITHUB_OUTPUT"; exit 0
+          fi
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
           test "$(tgit rev-parse "$commit^")" = "$REF_SHA"
           out="$RUNNER_TEMP/changeset"; mkdir -p "$out/blobs"
           jq -c '[.changes[] | select(.action != "unchanged") | .path]' "$RUNNER_TEMP/engine.json" >"$out/planned.json"
+          # adopt records what the client has and adds nothing: the only planned path is the lock.
+          if $adopt && ! jq -e '. == ["modules.lock.json"]' "$out/planned.json" >/dev/null; then sealfail adopt_failed planned_paths; fi
           jq -r '.pr.description // ""' "$RUNNER_TEMP/engine.json" | head -c 16384 >"$out/pr-body.md"
           tgit log -1 --format=%B "$commit" | head -c 8192 >"$out/commit-message.txt"
           : >"$out/files.jsonl"; n=0
           # raw diff of the engine commit against ref: `:oldmode newmode oldsha newsha status\0path\0`
           while IFS= read -r -d '' meta && IFS= read -r -d '' p; do
             read -r _om nm _os ns st <<<"${meta#:}"
+            if $adopt && ! [[ "$p" == "modules.lock.json" && "$nm" == "100644" && ( "$st" == "A" || "$st" == "M" ) ]]; then sealfail adopt_failed changed_paths; fi
             n=$((n+1)); blob="blobs/$(printf '%04d' "$n")"
             tgit cat-file blob "$ns" >"$out/$blob"
             jq -nc --arg path "$p" --arg mode "$nm" --arg status "$st" --arg blob "$blob" \
               --arg sha "$(sha256sum "$out/$blob" | cut -d' ' -f1)" --argjson size "$(stat -c %s "$out/$blob")" \
               '{path:$path,mode:$mode,status:$status,blob:$blob,sha256:$sha,size:$size}' >>"$out/files.jsonl"
           done < <(tgit diff-tree -r --raw -z --no-renames --no-abbrev "$REF_SHA" "$commit")
+          if $adopt; then
+            [[ "$n" == "1" ]] || sealfail adopt_failed changed_paths
+            # m3: the lock the engine committed must name this module at the dispatched version.
+            tgit cat-file blob "$commit:modules.lock.json" | jq -e --arg m "$MODULE" --arg v "$VERSION" '.modules[$m].version == $v' >/dev/null 2>&1               || sealfail adopt_lock_invalid lock_version
+          fi
           jq -n --arg op "$OP_ID" --arg module "$MODULE" --arg version "$VERSION" --arg base "$REF_SHA" --arg commit "$commit" \
             --slurpfile files "$out/files.jsonl" --slurpfile planned "$out/planned.json" \
             '{format:1,operation_id:$op,module:$module,version:$version,base_sha:$base,commit_sha:$commit,planned:$planned[0],files:$files}' >"$out/manifest.json"
@@ -670,7 +756,7 @@ jobs:
       # Client-code steps 2 and 3. Both run in the engine's Docker sandbox: read-only mount, no env, no network.
       - id: tsc
         name: tsc --noEmit (sandbox)
-        if: steps.engine.outcome == 'success' && steps.engine.outputs.engine_ok == 'true'
+        if: steps.engine.outcome == 'success' && steps.engine.outputs.engine_ok == 'true' && steps.seal.outputs.seal_code == ''
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -678,7 +764,7 @@ jobs:
 
       - id: vitest
         name: vitest run (sandbox)
-        if: steps.engine.outcome == 'success' && steps.engine.outputs.engine_ok == 'true'
+        if: steps.engine.outcome == 'success' && steps.engine.outputs.engine_ok == 'true' && steps.seal.outputs.seal_code == ''
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -698,6 +784,7 @@ jobs:
       needs.engine.outputs.tsc == 'success' &&
       needs.engine.outputs.vitest == 'success' &&
       needs.engine.outputs.engine_ok == 'true' &&
+      needs.engine.outputs.seal_code == '' &&
       needs.engine.outputs.changeset_ready == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 8
@@ -721,6 +808,7 @@ jobs:
           MODULE: ${{ inputs.module }}
           VERSION: ${{ inputs.version }}
           REF_SHA: ${{ inputs.ref }}
+          VERB: ${{ inputs.verb }}
         run: |
           set -euo pipefail
           fail() { echo "::error::changeset refused: $1"; echo "error_code=$1" >>"$GITHUB_OUTPUT"; exit 1; }
@@ -731,6 +819,11 @@ jobs:
           [[ "$(jq -r '.base_sha' "$m")" == "$REF_SHA" ]] || fail base_not_ref
           count="$(jq '.files | length' "$m")"
           (( count >= 1 && count <= 200 )) || fail file_count
+          # adopt is repeated here on purpose (the artefact crossed a job boundary): exactly the lock, a regular file, added or modified.
+          if [[ "$VERB" == "adopt" ]]; then
+            [[ "$count" == "1" && "$(jq -c '.planned' "$m")" == '["modules.lock.json"]' ]] || fail adopt_changeset_unexpected
+            [[ "$(jq -r '.files[0].path' "$m")" == "modules.lock.json" && "$(jq -r '.files[0].mode' "$m")" == "100644" ]] || fail adopt_changeset_unexpected
+          fi
           # The branch is derived here from validated inputs; a name carried by the artefact is never used.
           [[ "$(stat -c %s "$cs/commit-message.txt")" -le 8192 && "$(stat -c %s "$cs/pr-body.md")" -le 16384 ]] || fail text_too_large
           unsafe() { # same rules as the engine's schema/path-rules.mjs
@@ -792,8 +885,14 @@ jobs:
                       GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh "$@"; }
           fail() { echo "::error::publish failed: $1"; echo "error_code=$1" >>"$GITHUB_OUTPUT"; exit 1; }
           cs="$RUNNER_TEMP/changeset"; m="$cs/manifest.json"
-          BRANCH="modules/${MODULE}-${VERSION}"
-          [[ "$BRANCH" =~ ^modules/[a-z][a-z0-9-]*-[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail branch_invalid
+          # m6: the branch is built from validated inputs only, then re-checked against a strict whole-name grammar
+          # (no empty or doubled hyphen groups, bounded lengths, no leading/trailing separators). adopt has its own namespace.
+          case "$VERB" in
+            install|upgrade) BRANCH="modules/${MODULE}-${VERSION}" ;;
+            adopt) BRANCH="modules/adopt/${MODULE}-${VERSION}" ;;
+            *) fail verb_invalid ;;
+          esac
+          [[ "${#BRANCH}" -le 120 && "$BRANCH" =~ ^modules/(adopt/)?[a-z][a-z0-9]*(-[a-z0-9]+)*-[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] || fail branch_invalid
           BASE_BRANCH="dev" # J3-7: base is dev, a constant, never an input
           BASE_SHA="$(scrub jq -r '.base_sha' "$m")"
           gh_t api "repos/$TARGET_REPO/branches/$BASE_BRANCH" --jq .name >/dev/null || fail base_branch_missing
@@ -865,6 +964,11 @@ jobs:
           EN_TSC: ${{ needs.engine.outputs.tsc }}
           EN_VITEST: ${{ needs.engine.outputs.vitest }}
           EN_CHANGES: ${{ needs.engine.outputs.changes_count }}
+          # adopt only: fixed words from the engine's adopt code grammar (re-checked below); empty for other verbs.
+          AD_MAP_OK: ${{ needs.engine.outputs.adopt_map_ok }}
+          AD_MAP_CODE: ${{ needs.engine.outputs.adopt_map_code }}
+          AD_ENGINE_CODE: ${{ needs.engine.outputs.adopt_code }}
+          AD_SEAL_CODE: ${{ needs.engine.outputs.seal_code }}
           PUB_RESULT: ${{ needs.publish.result }}
           PUB_URL: ${{ needs.publish.outputs.pr_url }}
           PUB_ERROR: ${{ needs.publish.outputs.error_code }}
@@ -872,7 +976,7 @@ jobs:
           set -euo pipefail
           [[ "$OP_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "::error::no valid operation id, no artefact"; exit 1; }
           # source_sha is the verified checkout sha when a job got that far; otherwise ref, always with error_stage set.
-          src="$REF_SHA"; stage=""; code=""; pack=""; tables=""; url=""; seam=""; acc_ref=""; acc_exp=""; checks="false"
+          src="$REF_SHA"; stage=""; code=""; pack=""; tables=""; url=""; seam=""; acc_ref=""; acc_exp=""; checks="false"; adopt_out=""
           # provisional is never null (Central: z.boolean().optional()). Unknown after a passed gate means true: fail closed,
           # a provisional or unknown lock never satisfies the production gate (D9).
           prov="true"
@@ -892,7 +996,27 @@ jobs:
             [[ -n "$EN_SOURCE" ]] && src="$EN_SOURCE"
             [[ "$EN_PROV" == "true" || "$EN_PROV" == "false" ]] && prov="$EN_PROV"
             if [[ "$EN_NPM_CI" == "success" && "$EN_TSC" == "success" && "$EN_VITEST" == "success" ]]; then checks="true"; fi
-            if [[ "$EN_RESULT" != "success" ]]; then stage="engine"; code="job_failed"
+            if [[ "$VERB" == "adopt" ]]; then
+              # Order of gates for adopt (finding M3): every failure branch sets an adopt code, and the specific engine, map or
+              # seal code is chosen before the generic step failures so it can never be masked by them. A refused map comes
+              # first: it also skips npm ci, so the generic npm_ci branch would otherwise hide it.
+              known_adopt() { case "$1" in adopt_map_invalid|adopt_version_mismatch|adopt_withheld_mismatch|adopt_incomplete|adopt_drift_unexpected|adopt_lock_invalid|adopt_failed) return 0 ;; *) return 1 ;; esac; }
+              adopt_out="adopt_failed"
+              if [[ "$AD_MAP_OK" == "false" ]]; then stage="adopt_map"; code="adopt_map_invalid"; adopt_out="adopt_map_invalid"
+              elif [[ "$EN_RESULT" != "success" ]]; then stage="engine"; code="job_failed"
+              elif [[ "$AD_MAP_OK" != "true" ]]; then stage="adopt_map"; code="adopt_map_invalid"; adopt_out="adopt_map_invalid"
+              elif [[ "$EN_NPM_CI" != "success" ]]; then stage="npm_ci"; code="npm_ci_failed"
+              elif [[ "$EN_RUN" != "success" ]]; then stage="engine"; code="engine_run_failed"
+              elif [[ "$EN_OK" != "true" ]]; then
+                stage="engine"; adopt_out="adopt_failed"; if known_adopt "$AD_ENGINE_CODE"; then adopt_out="$AD_ENGINE_CODE"; fi; code="$adopt_out"
+              elif [[ -n "$AD_SEAL_CODE" ]]; then
+                stage="seal"; adopt_out="adopt_failed"; if known_adopt "$AD_SEAL_CODE"; then adopt_out="$AD_SEAL_CODE"; fi; code="$adopt_out"
+              elif [[ "$EN_TSC" != "success" ]]; then stage="tsc"; code="tsc_failed"
+              elif [[ "$EN_VITEST" != "success" ]]; then stage="vitest"; code="vitest_failed"
+              elif [[ "${EN_CHANGES:-0}" == "0" ]]; then adopt_out="adopt_ok" # the lock already matches: success with no pull request
+              elif [[ "$PUB_RESULT" != "success" ]]; then stage="publish"; code="$(lower "${PUB_ERROR:-publish_failed}")"
+              else url="$PUB_URL"; adopt_out="adopt_ok"; fi
+            elif [[ "$EN_RESULT" != "success" ]]; then stage="engine"; code="job_failed"
             elif [[ "$EN_NPM_CI" != "success" ]]; then stage="npm_ci"; code="npm_ci_failed"
             elif [[ "$EN_RUN" != "success" ]]; then stage="engine"; code="engine_run_failed"
             elif [[ "$EN_OK" != "true" ]]; then stage="engine"; code="$(lower "${EN_ERROR:-engine_blocked}")"
@@ -908,7 +1032,7 @@ jobs:
           # that got through npm ci, tsc and vitest (Central refuses those artefacts without all three "passed").
           jq -n --arg op "$OP_ID" --arg src "$src" --arg pack "$pack" --arg tables "$tables" --arg stage "$stage" --arg code "$code" --arg url "$url" \
             --arg gate "$GATE_OK" --arg env "$GATE_ENV" --arg pref "$GATE_PROJECT_REF" --arg prov "$prov" --arg verb "$VERB" --arg seam "$seam" \
-            --arg accref "$acc_ref" --arg accexp "$acc_exp" --arg checks "$checks" '
+            --arg accref "$acc_ref" --arg accexp "$acc_exp" --arg checks "$checks" --arg adopt "$adopt_out" '
             {operation_id:$op, source_sha:$src,
              pack_hash:(if $pack == "" then null else $pack end),
              readable_tables:(if $tables == "" then null else ($tables | fromjson) end),
@@ -918,7 +1042,8 @@ jobs:
              install_pr_url:(if $url == "" then null else $url end)}
             + (if $gate == "true" then {environment:$env, project_ref:$pref, provisional:($prov == "true"),
                  acceptance:(if $accref == "" or $accexp == "" then null else {decision_ref:$accref, expires_at:$accexp} end)} else {} end)
-            + (if $gate == "true" and $verb != "enable_check" and $checks == "true" then {checks:{npm_ci:"passed", tsc:"passed", vitest:"passed"}} else {} end)' >"$RUNNER_TEMP/result/result.json"
+            + (if $gate == "true" and $verb != "enable_check" and $checks == "true" then {checks:{npm_ci:"passed", tsc:"passed", vitest:"passed"}} else {} end)
+            + (if $gate == "true" and $verb == "adopt" and $adopt != "" then {adopt_code:$adopt} else {} end)' >"$RUNNER_TEMP/result/result.json"
           # Same limits as Central's reader: at most 512 KB unpacked (256 KB compressed). Keep clear of both.
           if [[ "$(stat -c %s "$RUNNER_TEMP/result/result.json")" -gt 400000 ]]; then
             jq -n --arg op "$OP_ID" --arg src "$src" '{operation_id:$op,source_sha:$src,error_stage:"result",error_code:"result_too_large"}' >"$RUNNER_TEMP/result/result.json"
