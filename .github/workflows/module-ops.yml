@@ -1043,7 +1043,8 @@ jobs:
             + (if $gate == "true" then {environment:$env, project_ref:$pref, provisional:($prov == "true"),
                  acceptance:(if $accref == "" or $accexp == "" then null else {decision_ref:$accref, expires_at:$accexp} end)} else {} end)
             + (if $gate == "true" and $verb != "enable_check" and $checks == "true" then {checks:{npm_ci:"passed", tsc:"passed", vitest:"passed"}} else {} end)
-            + (if $gate == "true" and $verb == "adopt" and $adopt != "" then {adopt_code:$adopt} else {} end)' >"$RUNNER_TEMP/result/result.json"
+            + (if $gate == "true" and $verb == "adopt" and $adopt != "" then {adopt_code:$adopt} else {} end)
+            + (if $gate == "true" and $verb == "adopt" and $url != "" then {planned:["modules.lock.json"]} else {} end)' >"$RUNNER_TEMP/result/result.json"
           # Same limits as Central's reader: at most 512 KB unpacked (256 KB compressed). Keep clear of both.
           if [[ "$(stat -c %s "$RUNNER_TEMP/result/result.json")" -gt 400000 ]]; then
             jq -n --arg op "$OP_ID" --arg src "$src" '{operation_id:$op,source_sha:$src,error_stage:"result",error_code:"result_too_large"}' >"$RUNNER_TEMP/result/result.json"
